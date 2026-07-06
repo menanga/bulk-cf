@@ -49,11 +49,27 @@ class EmailGenerator:
             "domain": domain,
         }
 
-    def check_inbox(self, jwt: str) -> list:
+    def check_inbox(self, jwt: str, limit: int = 20, offset: int = 0) -> list:
         """Check inbox for received emails."""
-        # This depends on your mail API implementation
         base = self.api_url.replace("/new_address", "")
-        r = self.client.get(f"{base}/parsed_mails", headers={"Authorization": f"Bearer {jwt}"})
+        r = self.client.get(
+            f"{base}/parsed_mails",
+            params={"limit": limit, "offset": offset},
+            headers={"Authorization": f"Bearer {jwt}"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            return data.get("results") or data.get("items") or []
+        return data
+
+    def get_mail(self, jwt: str, mail_id: str | int) -> dict:
+        """Get a parsed email by id."""
+        base = self.api_url.replace("/new_address", "")
+        r = self.client.get(
+            f"{base}/parsed_mail/{mail_id}",
+            headers={"Authorization": f"Bearer {jwt}"},
+        )
         r.raise_for_status()
         return r.json()
 

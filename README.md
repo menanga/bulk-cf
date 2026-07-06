@@ -18,7 +18,9 @@ This tool automates the **entire lifecycle** of creating Cloudflare accounts wit
 2. **🔐 Sign up Cloudflare account** — fill form, solve Turnstile CAPTCHA, submit
 3. **🔑 Create Account API Token** — with Workers AI (Read + Edit) permissions
 4. **✅ Validate token** — verify against Workers AI REST API
-5. **💾 Save to JSON** — email, password, account_id, api_token, validation status
+5. **💾 Save to JSON/TXT** — email, password, account_id, api_token, validation status
+6. **📊 Live dashboard** — optional Rich real-time worker progress/logs/statistics
+7. **🧩 9Router export/add** — export valid keys to 9Router-friendly TXT and bulk-add them locally
 
 **Output example:**
 ```json
@@ -86,8 +88,8 @@ This works because `mouse_click()` sends CDP `Input.dispatchMouseEvent` events t
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/cloudflare-auto-signup.git
-cd cloudflare-auto-signup
+git clone https://github.com/iAm-182/bluk-cf.git
+cd bluk-cf
 
 # Run setup script
 chmod +x scripts/setup.sh
@@ -139,8 +141,17 @@ xvfb-run --auto-servernum python main.py
 # Create 5 accounts with proxy
 xvfb-run --auto-servernum python main.py -n 5 -p "http://user:pass@host:port"
 
-# Create 10 accounts, custom output
-xvfb-run --auto-servernum python main.py -n 10 -o my_accounts.json
+# Create 10 accounts, custom output + 9Router TXT export
+xvfb-run --auto-servernum python main.py -n 10 -o my_accounts.json --export-txt keys.txt
+
+# Run with 2 concurrent workers and Rich live dashboard
+xvfb-run --auto-servernum python main.py -n 10 --workers 2 -p "http://user:pass@host:port"
+
+# Export existing valid results for 9Router
+python scripts/export_9router_txt.py -i results.json -o keys.txt
+
+# Bulk-add exported keys into local 9Router (localhost:20128)
+python scripts/add_to_9router.py -i keys.txt
 
 # Validate an existing token
 python main.py --validate-only --token cfut_xxx --account-id abc123
@@ -164,6 +175,9 @@ Options:
   -d, --delay SECS          Delay between accounts (default: 300)
   --headless                Run in headless mode
   --retry N                 Retry attempts per account (default: 3)
+  -w, --workers N           Concurrent account workers (default: 1)
+  --no-dashboard            Disable Rich live dashboard
+  --export-txt FILE         Export valid keys to 9Router-friendly TXT
   --validate-only           Only validate an existing token
   --token TOKEN             Token to validate (with --validate-only)
   --account-id ID           Account ID for validation
@@ -340,8 +354,8 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install -y xvfb google-chrome-stable python3.10 python3-pip git
 
 # Clone
-git clone https://github.com/YOUR_USERNAME/cloudflare-auto-signup.git
-cd cloudflare-auto-signup
+git clone https://github.com/iAm-182/bluk-cf.git
+cd bluk-cf
 
 # Python setup
 python3 -m venv .venv

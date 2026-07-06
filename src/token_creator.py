@@ -1,282 +1,510 @@
 """
-Account API Token Creator — Creates Cloudflare API tokens via dashboard UI.
+Cloudflare API Token Creator — API-first with UI fallback.
 
-Flow:
-1. Navigate to /{account_id}/api-tokens/create
-2. Fill token name
-3. Select "AI & Machine Learning" permission category
-4. Enable Workers AI (Read + Edit)
-5. Click "Review token"
-6. Click "Create Token"
-7. Extract cfut_* token
+Patch source: https://github.com/andreanocalvin/cloudflare-autologin
+Useful extracted parts:
+- POST /api/v4/user/tokens from the authenticated dashboard session
+- Workers AI permission group IDs:
+  - Read:  a92d2450e05d4e7bb7d0a64968f83d11
+  - Write: bacc64e0f6c34fc0883a1223f938a104
 
-Key Technical Notes:
-- Uses Account API Tokens (NOT User API Tokens)
-- URL: /{account_id}/api-tokens/create (auto-fills account filter)
-- React buttons require proper click handling:
-  - evaluate('button.click()') works for most buttons
-  - Some buttons need CDP Input.dispatchMouseEvent with proper coordinates
-- The "Create Token" button on the summary page sometimes needs JS click fallback
+Why API-first:
+- Cloudflare token creation UI is a React SPA and custom checkboxes are brittle.
+- The API response contains result.value (cfut_...) directly when successful.
+
+Fallback:
+- If API POST is blocked/fails, use /profile/api-tokens UI entry point.
+- UI still requires verified Cloudflare email; if email is unverified, no token is returned.
 """
 
+from __future__ import annotations
+
 import asyncio
+import json
 import re
 import time
-from typing import Optional
+from typing import Any
 
 import nodriver as uc
 
 
-class TokenResult:
-    """Result of a token creation attempt."""
+WORKERS_AI_READ_ID = "a92d2450e05d4e7bb7d0a64968f83d11"
+WORKERS_AI_WRITE_ID = "bacc64e0f6c34fc0883a1223f938a104"
 
+
+class TokenResult:
     def __init__(
         self,
         success: bool,
         token: str = "",
         token_name: str = "",
         error: str = "",
+        token_id: str = "",
+        method: str = "",
+        raw: Any = None,
     ):
         self.success = success
         self.token = token
         self.token_name = token_name
         self.error = error
+        self.token_id = token_id
+        self.method = method
+        self.raw = raw
+
+
+def _unwrap_nodriver_value(value: Any, default: Any = None) -> Any:
+    """Best-effort parser for nodriver page.evaluate() wrapped results."""
+    if value is None:
+        return default
+
+    # Common wrapper for JSON.stringify output: [[..., {type: 'string', value: '...'}]]
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, list) and len(item) >= 2 and isinstance(item[1], dict):
+                if "value" in item[1]:
+                    return item[1]["value"]
+        return value
+
+    if isinstance(value, dict):
+        if "value" in value:
+            return value["value"]
+        return value
+
+    return value
+
+
+def _loads_wrapped_json(raw: Any, default: Any = None) -> Any:
+    unwrapped = _unwrap_nodriver_value(raw, default="{}")
+    if isinstance(unwrapped, (dict, list)):
+        return unwrapped
+    try:
+        return json.loads(str(unwrapped))
+    except Exception:
+        return default
+
+
+async def _get_body_text(page: uc.Tab) -> str:
+    raw = await page.evaluate("document.body ? document.body.innerText : ''")
+    return str(_unwrap_nodriver_value(raw, default=""))
+
+
+async def get_account_id(page: uc.Tab, known_account_id: str = "") -> str:
+    """Get Cloudflare account_id from known value, URL, then /api/v4/accounts fallback."""
+    if known_account_id and re.fullmatch(r"[a-f0-9]{32}", known_account_id):
+        return known_account_id
+
+    try:
+        url = str(await page.evaluate("location.href"))
+        m = re.search(r"/([a-f0-9]{32})(?:/|$)", url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+
+    try:
+        raw = await page.evaluate(
+            """
+            (async () => {
+                const r = await fetch('/api/v4/accounts?per_page=50', {
+                    credentials: 'include',
+                    headers: {'Accept': 'application/json'}
+                });
+                const text = await r.text();
+                return JSON.stringify({status: r.status, body: text});
+            })()
+            """,
+            await_promise=True,
+            return_by_value=True,
+        )
+        data = _loads_wrapped_json(raw, default={}) or {}
+        if data.get("status") == 200:
+            body = json.loads(data.get("body") or "{}")
+            accounts = body.get("result") or []
+            if accounts and accounts[0].get("id"):
+                return accounts[0]["id"]
+    except Exception:
+        pass
+
+    return ""
+
+
+async def create_token_api(
+    page: uc.Tab,
+    account_id: str = "",
+    token_name: str = "workers-ai-auto",
+) -> TokenResult:
+    """Create a Workers AI API token via Cloudflare dashboard session API."""
+    account_id = await get_account_id(page, account_id)
+
+    print("    Trying direct token API POST /api/v4/user/tokens...")
+    token_name_js = json.dumps(token_name)
+    raw = await page.evaluate(
+        f"""
+        (async () => {{
+            const body = {{
+                name: {token_name_js},
+                condition: {{}},
+                policies: [{{
+                    effect: 'allow',
+                    resources: {{'com.cloudflare.api.account.*': '*'}},
+                    permission_groups: [
+                        {{id: 'a92d2450e05d4e7bb7d0a64968f83d11'}},
+                        {{id: 'bacc64e0f6c34fc0883a1223f938a104'}}
+                    ]
+                }}]
+            }};
+
+            const r = await fetch('/api/v4/user/tokens', {{
+                method: 'POST',
+                credentials: 'include',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                }},
+                body: JSON.stringify(body)
+            }});
+            const text = await r.text();
+            return JSON.stringify({{status: r.status, body: text}});
+        }})()
+        """,
+        await_promise=True,
+        return_by_value=True,
+    )
+
+    data = _loads_wrapped_json(raw, default={}) or {}
+    status = data.get("status")
+    body_text = data.get("body") or ""
+
+    if status != 200:
+        snippet = body_text[:500].replace("\n", " ")
+        try:
+            err_resp = json.loads(body_text)
+            err_messages = " | ".join(
+                str(e.get("message", e)) for e in (err_resp.get("errors") or [])
+            )
+            if "verify" in err_messages.lower() and "email" in err_messages.lower():
+                return TokenResult(
+                    False,
+                    token_name=token_name,
+                    error="email_not_verified",
+                    method="api",
+                    raw={"status": status, "body": err_resp},
+                )
+        except Exception:
+            pass
+        if status == 403 and "Attention Required" in body_text:
+            return TokenResult(
+                False,
+                token_name=token_name,
+                error="api_waf_403_attention_required",
+                method="api",
+                raw={"status": status, "body": snippet},
+            )
+        return TokenResult(
+            False,
+            token_name=token_name,
+            error=f"api_http_{status}: {snippet}",
+            method="api",
+            raw={"status": status, "body": snippet},
+        )
+
+    try:
+        resp = json.loads(body_text)
+    except Exception:
+        return TokenResult(False, token_name=token_name, error="api_invalid_json", method="api", raw=body_text[:500])
+
+    if resp.get("success") and resp.get("result", {}).get("value"):
+        return TokenResult(
+            True,
+            token=resp["result"]["value"],
+            token_name=token_name,
+            token_id=resp.get("result", {}).get("id", ""),
+            method="api",
+            raw=resp,
+        )
+
+    errors = resp.get("errors") or []
+    messages = " | ".join(str(e.get("message", e)) for e in errors) if errors else str(resp)[:500]
+    if "verify" in messages.lower() and "email" in messages.lower():
+        err = "email_not_verified"
+    else:
+        err = f"api_token_failed: {messages}"
+
+    return TokenResult(False, token_name=token_name, error=err, method="api", raw=resp)
+
+
+async def _press_tab(page: uc.Tab) -> None:
+    await page.send(uc.cdp.input_.dispatch_key_event("keyDown", key="Tab", code="Tab"))
+    await page.send(uc.cdp.input_.dispatch_key_event("keyUp", key="Tab", code="Tab"))
+
+
+async def _press_space(page: uc.Tab) -> None:
+    await page.send(uc.cdp.input_.dispatch_key_event("keyDown", key=" ", code="Space"))
+    await page.send(uc.cdp.input_.dispatch_key_event("keyUp", key=" ", code="Space"))
+
+
+async def _focused_checkbox_state(page: uc.Tab) -> dict:
+    raw = await page.evaluate(
+        """
+        (() => {
+            const el = document.activeElement;
+            if (!el) return JSON.stringify({tag: 'none'});
+            const rect = el.getBoundingClientRect();
+            return JSON.stringify({
+                tag: el.tagName,
+                role: el.getAttribute('role') || '',
+                ariaChecked: el.getAttribute('aria-checked') || '',
+                text: (el.textContent || '').substring(0, 60),
+                x: Math.round(rect.x),
+                y: Math.round(rect.y)
+            });
+        })()
+        """
+    )
+    return _loads_wrapped_json(raw, default={}) or {}
+
+
+async def create_token_ui(
+    page: uc.Tab,
+    account_id: str,
+    token_name: str = "workers-ai-auto",
+    timeout: float = 160,
+) -> TokenResult:
+    """UI fallback via account API Tokens page -> Create a token.
+
+    User-confirmed working path:
+    - https://dash.cloudflare.com/{account_id}/api-tokens
+    - Click body link/button "Create a token" (or header "+ Create Token")
+    - Lands on /{account_id}/api-tokens/create with Token name, AI & ML, Review token.
+
+    Profile page /profile/api-tokens remains a secondary fallback.
+    """
+    start = time.time()
+    print("    Opening account API Tokens page...")
+
+    account_id = await get_account_id(page, account_id)
+    entry_urls = []
+    if account_id:
+        entry_urls.append(f"https://dash.cloudflare.com/{account_id}/api-tokens")
+    entry_urls.append("https://dash.cloudflare.com/profile/api-tokens")
+
+    clicked = False
+    for entry_url in entry_urls:
+        await page.get(entry_url)
+        await asyncio.sleep(12)
+
+        current_url = str(await page.evaluate("location.href"))
+        if "login" in current_url.lower():
+            return TokenResult(False, token_name=token_name, error="Not logged in — session expired", method="ui")
+
+        # Cookie banner blocks clicks.
+        try:
+            allow_btn = await page.find("Allow All", best_match=True, timeout=4)
+            if allow_btn:
+                await allow_btn.click()
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+        # Prefer the body link the user identified: "Create a token".
+        # Then try header "+ Create Token" / "Create Token".
+        print(f"    Clicking Create token entry from {entry_url}...")
+        for label in ("Create a token", "Create Token", "Create token"):
+            try:
+                btn = await page.find(label, best_match=True, timeout=7)
+                if btn:
+                    await btn.scroll_into_view()
+                    await asyncio.sleep(0.5)
+                    await btn.click()
+                    await asyncio.sleep(10)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if clicked:
+            break
+
+    if not clicked:
+        return TokenResult(False, token_name=token_name, error="ui_create_token_entry_not_found", method="ui")
+
+    # Some layouts show token templates first; use Custom/Get started if present.
+    for label in ("Get started", "Custom"):
+        try:
+            el = await page.find(label, best_match=True, timeout=5)
+            if el:
+                await el.scroll_into_view()
+                await asyncio.sleep(0.5)
+                await el.click()
+                await asyncio.sleep(5)
+                if label == "Custom":
+                    ai_opt = await page.find("AI & Machine Learning", best_match=True, timeout=5)
+                    if ai_opt:
+                        await ai_opt.click()
+                        await asyncio.sleep(5)
+                break
+        except Exception:
+            pass
+
+    # Try fill token name if field exists (Cloudflare often auto-fills random name).
+    try:
+        name_input = await page.find("Token name", best_match=True, timeout=5)
+        if not name_input:
+            name_input = await page.find("Enter token name", best_match=True, timeout=5)
+        if name_input:
+            await name_input.click()
+            await asyncio.sleep(0.3)
+            # Avoid Control+A portability; append unique suffix is okay if auto-filled.
+            await name_input.send_keys(token_name)
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+
+    # Permission: choose AI & ML template and search Workers AI; then Tab+Space on custom checkbox.
+    print("    Selecting Workers AI permission via keyboard...")
+    try:
+        custom_btn = await page.find("Custom", best_match=True, timeout=6)
+        if custom_btn:
+            await custom_btn.scroll_into_view()
+            await asyncio.sleep(0.5)
+            await custom_btn.click()
+            await asyncio.sleep(3)
+            ai_opt = await page.find("AI & Machine Learning", best_match=True, timeout=5)
+            if ai_opt:
+                await ai_opt.click()
+                await asyncio.sleep(5)
+    except Exception:
+        pass
+
+    search = None
+    try:
+        search = await page.find("Search for permission groups", best_match=True, timeout=8)
+        if search:
+            await search.scroll_into_view()
+            await asyncio.sleep(0.5)
+            await search.click()
+            await asyncio.sleep(0.5)
+            await search.send_keys("Workers AI")
+            await asyncio.sleep(3)
+    except Exception:
+        pass
+
+    if search:
+        await search.scroll_into_view()
+        await asyncio.sleep(0.5)
+        await search.click()
+        await asyncio.sleep(0.5)
+        for i in range(30):
+            await _press_tab(page)
+            await asyncio.sleep(0.25)
+            focused = await _focused_checkbox_state(page)
+            if focused.get("role") == "checkbox" and focused.get("ariaChecked") == "false":
+                await _press_space(page)
+                await asyncio.sleep(2)
+                focused_after = await _focused_checkbox_state(page)
+                if focused_after.get("ariaChecked") == "true":
+                    print(f"    ✅ Checked permission checkbox at tab #{i}")
+                    break
+
+    # Review button can be "Review token" or "Continue to summary" depending entry point.
+    print("    Clicking Review/Continue...")
+    reviewed = False
+    for label in ("Review token", "Continue to summary"):
+        try:
+            btn = await page.find(label, best_match=True, timeout=10)
+            if btn:
+                await btn.scroll_into_view()
+                await asyncio.sleep(0.8)
+                await btn.click()
+                await asyncio.sleep(12)
+                reviewed = True
+                break
+        except Exception:
+            continue
+    if not reviewed:
+        body = await _get_body_text(page)
+        if "Please verify your email" in body:
+            return TokenResult(False, token_name=token_name, error="email_not_verified", method="ui")
+        return TokenResult(False, token_name=token_name, error="ui_review_button_not_found_or_disabled", method="ui")
+
+    body = await _get_body_text(page)
+    if "Please verify your email" in body:
+        return TokenResult(False, token_name=token_name, error="email_not_verified", method="ui")
+
+    print("    Clicking final Create token...")
+    final_clicked = False
+    for label in ("Create token", "Create Token"):
+        try:
+            btn = await page.find(label, best_match=True, timeout=12)
+            if btn:
+                await btn.scroll_into_view()
+                await asyncio.sleep(0.8)
+                await btn.click()
+                await asyncio.sleep(18)
+                final_clicked = True
+                break
+        except Exception:
+            continue
+    if not final_clicked:
+        return TokenResult(False, token_name=token_name, error="ui_final_create_token_not_found", method="ui")
+
+    # Extract token from HTML/body.
+    for _ in range(8):
+        content = ""
+        try:
+            content = str(await page.get_content())
+        except Exception:
+            pass
+        body = await _get_body_text(page)
+        for haystack in (content, body):
+            token_match = re.search(r"cfut_[A-Za-z0-9_\-]{20,}", haystack)
+            if token_match:
+                return TokenResult(True, token=token_match.group(0), token_name=token_name, method="ui")
+        if "Please verify your email" in body:
+            return TokenResult(False, token_name=token_name, error="email_not_verified", method="ui")
+        await asyncio.sleep(3)
+
+    elapsed = time.time() - start
+    return TokenResult(False, token_name=token_name, error=f"ui_token_not_found_after_{elapsed:.0f}s", method="ui")
 
 
 async def create_token(
     page: uc.Tab,
     account_id: str,
     token_name: str = "workers-ai-auto",
-    timeout: float = 120,
+    timeout: float = 180,
 ) -> TokenResult:
     """
-    Create an Account API Token with Workers AI permissions.
+    Create Cloudflare Workers AI token.
 
-    Args:
-        page: nodriver Tab (already logged in)
-        account_id: Cloudflare Account ID (32-char hex)
-        token_name: Name for the token
-        timeout: Max seconds for the whole flow
+    User-confirmed bot v1 entry point:
+    1. Open https://dash.cloudflare.com/{account_id}/api-tokens first
+       (this is the Account API Tokens page observed after signup).
+    2. Click the body "Create a token" link/button, or header "+ Create Token".
+    3. It should open https://dash.cloudflare.com/{account_id}/api-tokens/create
+       with Token name, AI & Machine Learning permissions, Review token.
+    4. Fill/select token settings and extract cfut_*.
 
-    Returns:
-        TokenResult with cfut_* token on success
+    /profile/api-tokens and direct API are kept only as fallback/debug paths,
+    not the primary v1 path.
     """
-    start = time.time()
+    ui_result = await create_token_ui(page, account_id=account_id, token_name=token_name, timeout=timeout)
+    if ui_result.success:
+        print("    ✅ Token created via /profile/api-tokens UI")
+        return ui_result
 
-    # Step 1: Navigate to token creation form
-    create_url = f"https://dash.cloudflare.com/{account_id}/api-tokens/create"
-    await page.get(create_url)
-    await asyncio.sleep(15)
+    print(f"    ⚠️ Profile UI token creation failed: {ui_result.error}")
 
-    # Verify we're on the creation page
-    current_url = await page.evaluate("location.href")
-    if "login" in current_url.lower():
-        return TokenResult(False, error="Not logged in — session expired")
+    api_result = await create_token_api(page, account_id=account_id, token_name=token_name)
+    if api_result.success:
+        print("    ✅ Token created via API fallback")
+        return api_result
 
-    # Step 2: Fill token name
-    name_input = await page.select('input[aria-label*="Token name"]', timeout=10)
-    if name_input:
-        await name_input.click()
-        await asyncio.sleep(0.5)
-        await name_input.send_keys(token_name)
-    else:
-        # Fallback: use JS
-        filled = await page.evaluate("""
-            (() => {
-                const inputs = document.querySelectorAll('input[type="text"]');
-                for (const i of inputs) {
-                    if (i.getAttribute('aria-label')?.includes('Token') || i.placeholder?.includes('name')) {
-                        const nativeSet = Object.getOwnPropertyDescriptor(
-                            HTMLInputElement.prototype, 'value'
-                        ).set;
-                        nativeSet.call(i, '""" + token_name + """');
-                        i.dispatchEvent(new Event('input', {bubbles: true}));
-                        i.dispatchEvent(new Event('change', {bubbles: true}));
-                        return true;
-                    }
-                }
-                return false;
-            })()
-        """)
-        if not filled:
-            return TokenResult(False, token_name=token_name, error="Token name input not found")
-    await asyncio.sleep(2)
+    api_result.error = f"profile_ui={ui_result.error}; api={api_result.error}"
+    return api_result
 
-    # Step 3: Click "AI & Machine Learning" category
-    ai_clicked = await page.evaluate("""
-        (() => {
-            const btns = document.querySelectorAll('button');
-            for (const b of btns) {
-                if (b.textContent.trim().includes('AI & Machine Learning')) {
-                    b.scrollIntoView({block: 'center'});
-                    b.click();
-                    return true;
-                }
-            }
-            return false;
-        })()
-    """)
-    if not ai_clicked:
-        return TokenResult(False, token_name=token_name, error="AI & Machine Learning category not found")
-    await asyncio.sleep(5)
 
-    # Step 4: Select Workers AI permissions
-    # Find and enable Workers AI Read + Edit checkboxes
-    perms_selected = await page.evaluate("""
-        (() => {
-            const results = [];
-            // Find the Workers AI section
-            const allText = document.body.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-            while (allText.nextNode()) {
-                const text = allText.currentNode.textContent.trim();
-                if (text === 'Workers AI' || text.startsWith('Workers AI ')) {
-                    const parent = allText.currentNode.parentElement;
-                    const container = parent?.closest('div, tr, li, section');
-                    if (container) {
-                        // Find checkboxes within this container
-                        const checkboxes = container.querySelectorAll(
-                            'input[type="checkbox"], [role="checkbox"]'
-                        );
-                        checkboxes.forEach(cb => {
-                            if (cb.type === 'checkbox' && !cb.checked) {
-                                cb.click();
-                                results.push('checked: ' + (cb.name || cb.id || 'checkbox'));
-                            } else if (cb.getAttribute('role') === 'checkbox') {
-                                cb.click();
-                                results.push('clicked role=checkbox');
-                            }
-                        });
-                        if (results.length === 0) {
-                            // Try clicking the container itself to expand/select
-                            container.click();
-                            results.push('clicked container');
-                        }
-                    }
-                    break;
-                }
-            }
-            return results.length > 0 ? results.join(', ') : 'not found';
-        })()
-    """)
-    await asyncio.sleep(3)
+__all__ = ["TokenResult", "create_token", "create_token_api", "create_token_ui", "get_account_id"]
 
-    # Step 5: Click "Review token"
-    review_clicked = await page.evaluate("""
-        (() => {
-            const btns = document.querySelectorAll('button');
-            for (const b of btns) {
-                const text = b.textContent.trim();
-                if (text === 'Review token' || text === 'Continue to summary') {
-                    b.scrollIntoView({block: 'center'});
-                    b.click();
-                    return text;
-                }
-            }
-            return 'not found';
-        })()
-    """)
-    if "not found" in str(review_clicked):
-        return TokenResult(False, token_name=token_name, error="Review button not found")
-    await asyncio.sleep(12)
-
-    # Step 6: Click "Create Token" on summary page
-    # Try multiple click strategies
-    create_clicked = False
-
-    # Strategy 1: JS click
-    create_clicked = await page.evaluate("""
-        (() => {
-            const btns = document.querySelectorAll('button');
-            for (const b of btns) {
-                if (b.textContent.trim() === 'Create Token' && !b.disabled) {
-                    b.scrollIntoView({block: 'center'});
-                    b.click();
-                    return true;
-                }
-            }
-            return false;
-        })()
-    """)
-
-    if not create_clicked:
-        # Strategy 2: Find via nodriver
-        try:
-            btn = await page.find("Create Token", best_match=True, timeout=10)
-            if btn:
-                await btn.click()
-                create_clicked = True
-        except Exception:
-            pass
-
-    if not create_clicked:
-        # Strategy 3: CDP mouse click at button coordinates
-        coords = await page.evaluate("""
-            (() => {
-                const btns = document.querySelectorAll('button');
-                for (const b of btns) {
-                    if (b.textContent.trim() === 'Create Token' && !b.disabled) {
-                        const r = b.getBoundingClientRect();
-                        return JSON.stringify({
-                            x: Math.round(r.x + r.width/2),
-                            y: Math.round(r.y + r.height/2)
-                        });
-                    }
-                }
-                return '{"x":0,"y":0}';
-            })()
-        """)
-        import json
-        try:
-            c = json.loads(coords) if isinstance(coords, str) else {"x": 0, "y": 0}
-            if c["x"] > 0:
-                from nodriver.cdp.input_ import MouseButton
-                await page.send(uc.cdp.input_.dispatch_mouse_event(
-                    type_="mouseMoved", x=c["x"], y=c["y"]
-                ))
-                await asyncio.sleep(0.3)
-                await page.send(uc.cdp.input_.dispatch_mouse_event(
-                    type_="mousePressed", x=c["x"], y=c["y"],
-                    button=MouseButton("left"), click_count=1
-                ))
-                await asyncio.sleep(0.1)
-                await page.send(uc.cdp.input_.dispatch_mouse_event(
-                    type_="mouseReleased", x=c["x"], y=c["y"],
-                    button=MouseButton("left"), click_count=1
-                ))
-                create_clicked = True
-        except Exception:
-            pass
-
-    if not create_clicked:
-        return TokenResult(False, token_name=token_name, error="Create Token button not clickable")
-
-    # Step 7: Wait for token to appear
-    await asyncio.sleep(12)
-
-    # Extract token
-    token = await page.evaluate("""
-        (() => {
-            const body = document.body.innerText;
-            const m = body.match(/cfut_[A-Za-z0-9_\\-]{20,}/);
-            if (m) return m[0];
-
-            // Check code/pre elements
-            const codes = document.querySelectorAll('code, pre, input[readonly]');
-            for (const c of codes) {
-                const t = (c.value || c.textContent || '').trim();
-                if (t.startsWith('cfut_') && t.length > 20) return t;
-            }
-            return '';
-        })()
-    """)
-
-    if token and token.startswith("cfut_"):
-        return TokenResult(True, token=token, token_name=token_name)
-
-    # Check for errors
-    elapsed = time.time() - start
-    return TokenResult(
-        False,
-        token_name=token_name,
-        error=f"Token not found after {elapsed:.0f}s",
-    )
+if __name__ == "__main__":
+    print("This module is imported by main.py. Run main.py instead.")
