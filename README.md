@@ -81,7 +81,7 @@ docker run --rm \
   -e GMAIL_EMAIL=your_email@gmail.com \
   -e GMAIL_APP_PASSWORD=your_app_password \
   -e NINE_ROUTER_PASSWORD=your_password \
-  -e NINE_ROUTER_URL=https://oapi.fastev.my.id/api \
+  -e NINE_ROUTER_URL=https://my-9router-or-omniroute.com/api \
   -e DOMAINS=domain1.com,domain2.com \
   -e MAX_ACCOUNTS=10 \
   -e BATCH_SIZE=5 \
@@ -120,10 +120,10 @@ GMAIL_APP_PASSWORD=your_app_password
 
 # 9Router API (optional, for batch deploy)
 NINE_ROUTER_PASSWORD=your_9router_password
-NINE_ROUTER_URL=https://oapi.fastev.my.id/api
+NINE_ROUTER_URL=https://my-9router-or-omniroute.com/api
 
 # Domains (comma-separated or newline-separated)
-DOMAINS=forumbaris.com,menangatechnology.my.id,fastev.my.id
+DOMAINS=domain1.com,domain2.com,domain3.com
 
 # Batch processing settings
 MAX_ACCOUNTS=10          # Total accounts to create
@@ -138,10 +138,10 @@ HEADLESS=false            # Run browser in headless mode
 One domain per line:
 
 ```
-forumbaris.com
-menangatechnology.my.id
-fastev.my.id
-hamanstore.biz.id
+domain1.com
+domain2.com
+domain3.com
+domain4.com
 ```
 
 Script cycles through domains for email generation.
@@ -175,7 +175,7 @@ graph TD
     M -->|Yes| O[Export to CSV immediately]
     O --> P{More accounts?}
     P -->|Yes| C
-    P -->|No| Q[Batch deploy to 9router]
+    P -->|No| Q[Batch deploy to 9router/Omniroute]
     Q --> R[End]
 ```
 

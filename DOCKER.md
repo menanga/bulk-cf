@@ -29,7 +29,7 @@ docker run -d \
   -e GMAIL_EMAIL="your@gmail.com" \
   -e GMAIL_APP_PASSWORD="your_app_password" \
   -e NINE_ROUTER_PASSWORD="your_password" \
-  -e NINE_ROUTER_URL="https://oapi.fastev.my.id/api" \
+  -e NINE_ROUTER_URL="https://my-9router-or-omniroute.com/api" \
   -e DOMAINS="domain1.com,domain2.org" \
   -e MAX_ACCOUNTS=0 \
   -e HEADLESS=false \

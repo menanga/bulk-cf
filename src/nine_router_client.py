@@ -3,7 +3,7 @@ from typing import Any
 
 
 class NineRouterClient:
-    BASE_URL = "https://oapi.fastev.my.id/api"
+    BASE_URL = "https://my-9router-or-omniroute.com/api"
 
     def __init__(self):
         self.client = httpx.Client(timeout=30.0)
