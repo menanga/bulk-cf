@@ -24,7 +24,7 @@ class NineRouterClient:
 
         cookie_header = response.headers.get("set-cookie", "")
         for part in cookie_header.split(";"):
-            if part.strip().startswith("auth_token="):
+            if part.strip().startswith(("auth_token=", "9router=")):
                 token = part.split("=", 1)[1]
                 self.token = token
                 return token
@@ -35,7 +35,7 @@ class NineRouterClient:
         response = self.client.post(
             f"{self.base_url}/providers/bulk",
             headers={
-                "Cookie": f"auth_token={token}",
+                "Cookie": f"auth_token={token};9router={token}",
                 "Content-Type": "application/json"
             },
             json={
