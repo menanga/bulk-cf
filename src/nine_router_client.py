@@ -39,6 +39,12 @@ class NineRouterClient:
 
         raise ValueError("auth_token not found in Set-Cookie header")
 
+    def _headers(self, token: str) -> dict[str, str]:
+        return {
+            "Cookie": f"auth_token={token};9router={token}",
+            "Content-Type": "application/json"
+        }
+
     def deploy_provider(self, token: str, entry: dict) -> dict[str, Any]:
         """Push a single Cloudflare AI credential to /api/providers."""
         payload = {
@@ -54,10 +60,7 @@ class NineRouterClient:
 
         response = self.client.post(
             f"{self.base_url}/providers",
-            headers={
-                "Cookie": f"auth_token={token};9router={token}",
-                "Content-Type": "application/json"
-            },
+            headers=self._headers(token),
             json=payload
         )
         response.raise_for_status()
@@ -65,4 +68,35 @@ class NineRouterClient:
         try:
             return response.json()
         except ValueError:
-            return {"success": True}
+            return {}
+
+    def tag_provider(self, token: str, provider_id: str, tag: str) -> dict[str, Any]:
+        """Tag an existing provider connection with the email domain."""
+        response = self.client.put(
+            f"{self.base_url}/providers/{provider_id}",
+            headers=self._headers(token),
+            json={
+                "providerSpecificData": {
+                    "tag": tag
+                }
+            }
+        )
+        response.raise_for_status()
+
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
+    @staticmethod
+    def extract_provider_id(data: dict[str, Any]) -> str | None:
+        """Read the connection id from a POST /api/providers response."""
+        connection = data.get("connection") or {}
+        return connection.get("id") or data.get("id")
+
+    @staticmethod
+    def domain_from_email(email: str | None) -> str | None:
+        """Extract the domain part of an address (account@gmail.com -> gmail.com)."""
+        if not email or "@" not in email:
+            return None
+        return email.rsplit("@", 1)[1].strip().lower()
