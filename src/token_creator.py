@@ -16,7 +16,9 @@ How full access is built (per docs):
    fails validation with HTTP 400 ("These rules must pass for ...").
    Each policy is also chunked to max 300 permission_groups (API limit).
 3. If the full-access payload is still rejected (400), fall back to a
-   Workers AI Read/Write token so every account is AI-capable.
+   Workers AI Read/Write + Account Analytics Read token so every account is
+   AI-capable and can read account analytics (analytics group resolved by
+   name from the live listing; skipped with a warning if not present).
 4. The response contains result.value (cfut_...) — the secret is shown only once.
 
 Why API-only:
@@ -188,7 +190,7 @@ async def _get_all_permission_groups(page: uc.Tab) -> tuple[list[dict], dict]:
                 scopes = group.get("scopes")
                 if scopes is None:
                     scopes = (group.get("meta") or {}).get("scopes")
-                groups.append({"id": gid, "scopes": scopes})
+                groups.append({"id": gid, "name": group.get("name", ""), "scopes": scopes})
 
         result_info = resp.get("result_info") or {}
         total_pages = result_info.get("total_pages") or 1
@@ -197,6 +199,15 @@ async def _get_all_permission_groups(page: uc.Tab) -> tuple[list[dict], dict]:
         api_page += 1
 
     return groups, {}
+
+
+def _find_group(groups: list[dict], keywords: tuple) -> dict:
+    """First group whose (lower-cased) name contains all keywords."""
+    for group in groups:
+        name = (group.get("name") or "").lower()
+        if name and all(k in name for k in keywords):
+            return group
+    return {}
 
 
 def _scope_buckets(scopes: Any) -> set:
@@ -297,8 +308,9 @@ async def create_token_api(
     with HTTP 400 ("These rules must pass for ...").
 
     If the strict payload is rejected with 400, one fallback attempt is made
-    with Workers AI Read/Write only (guaranteed capability, like the original
-    API path). Retries on 429 with exponential backoff.
+    with Workers AI Read/Write + Account Analytics Read (guaranteed
+    capability, like the original API path). Retries on 429 with exponential
+    backoff.
     """
     print("    Listing permission groups for full-access token...")
     groups, list_error = await _get_all_permission_groups(page)
@@ -319,16 +331,37 @@ async def create_token_api(
     if not policies:
         return TokenResult(False, token_name=token_name, error="permission_groups_no_scopes", method="api")
 
+    # Guaranteed fallback scope: Workers AI Read/Write (stable ids) plus
+    # "Account Analytics Read", resolved by name from the live listing since
+    # no reliable hardcoded id exists for it.
+    fallback_account_ids = [WORKERS_AI_READ_ID, WORKERS_AI_WRITE_ID]
+    fallback_zone_ids: list[str] = []
+    analytics_group = _find_group(groups, ("account analytics", "read"))
+    if analytics_group:
+        buckets = _scope_buckets(analytics_group.get("scopes")) or {"account"}
+        if "zone" in buckets and "account" not in buckets:
+            fallback_zone_ids.append(analytics_group["id"])
+        else:
+            fallback_account_ids.append(analytics_group["id"])
+        print(f"    Fallback includes '{analytics_group.get('name')}' ({analytics_group['id']}).")
+    else:
+        print("    ⚠️ Account Analytics Read group not found in listing; fallback stays Workers AI only.")
+
     workers_ai_policies = [
         {
             "effect": "allow",
             "resources": dict(POLICY_RESOURCES["account"]),
-            "permission_groups": [
-                {"id": WORKERS_AI_READ_ID},
-                {"id": WORKERS_AI_WRITE_ID},
-            ],
+            "permission_groups": [{"id": gid} for gid in fallback_account_ids],
         }
     ]
+    if fallback_zone_ids:
+        workers_ai_policies.append(
+            {
+                "effect": "allow",
+                "resources": dict(POLICY_RESOURCES["zone"]),
+                "permission_groups": [{"id": gid} for gid in fallback_zone_ids],
+            }
+        )
 
     # Variant 1: full access (all groups, chunked under the 300-per-policy cap).
     # Variant 2: Workers AI fallback so the account is always usable for AI.
