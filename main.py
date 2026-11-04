@@ -27,11 +27,15 @@ from pathlib import Path
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
+# Load .env file if exists
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.email_generator import EmailGenerator
-from src.email_verifier import verify_cloudflare_email
+from src.email_verifier import verify_cloudflare_email, delete_verification_email
 from src.nine_router_client import NineRouterClient
 from src.signup_flow import signup
-from src.token_creator import create_token
+from src.token_creator import create_token, wait_for_verified_session
 from src.token_validator import validate_token
 
 
@@ -83,6 +87,7 @@ async def process_account(
     headless: bool,
     progress,
     task_id,
+    cf_password: str = "",
 ) -> dict:
     """
     Process single account through full pipeline.
@@ -105,7 +110,9 @@ async def process_account(
         import nodriver as uc
         from src.utils import generate_password
 
-        password = generate_password()
+        # Use the configured shared password (CF_PASSWORD) when set,
+        # otherwise fall back to a random password per account.
+        password = cf_password or generate_password()
 
         # Docker/non-root needs no_sandbox flag
         browser_config = uc.Config()
@@ -171,11 +178,42 @@ async def process_account(
         # Navigate verification link in existing browser to activate account
         await page.get(verification_link)
         await asyncio.sleep(5)
+        landing_url = str(await page.evaluate("location.href"))[:120]
+        logger.info(f"✓ Step 3: Verification link opened (landed: {landing_url})")
+
+        # Confirm the account is actually verified BEFORE the token API call —
+        # Cloudflare rejects token creation until the verified flag is set.
+        progress.update(task_id, description=f"[cyan]Confirming verification: {email}")
+        logger.info(f"→ Step 3: Waiting for verified state before token creation")
+        verified = await wait_for_verified_session(
+            page,
+            verification_link=verification_link,
+            account_id=account_id,
+            timeout=120,
+        )
+        if not verified:
+            logger.error("✗ Step 3: Account still unverified after 120s — aborting")
+            try:
+                await browser.stop()
+            except:
+                pass
+            return {"success": False, "email": email, "error": "email_not_verified_timeout"}
+
         logger.info(f"✓ Step 3: Email verified")
 
-        # Step 4: Create Workers AI token (browser session + verified account)
+        # Confirmed — remove the verification email so the catch-all inbox stays
+        # clean and stale/expired links can't be picked up for later accounts.
+        deleted = await asyncio.to_thread(
+            delete_verification_email, gmail_user, gmail_password, email, uid=verify_result.uid
+        )
+        if deleted:
+            logger.info("✓ Step 3: Verification email deleted from Gmail")
+        else:
+            logger.warning("⚠ Step 3: Could not delete verification email (non-fatal)")
+
+        # Step 4: Create full-access API token (browser session + verified account)
         progress.update(task_id, description=f"[cyan]Creating token: {email}")
-        logger.info(f"→ Step 4: Creating Workers AI token")
+        logger.info(f"→ Step 4: Creating full-access token via API")
         token_result = await create_token(page=page, account_id=account_id)
 
         # Close browser after token creation
@@ -232,6 +270,7 @@ async def main():
     parser.add_argument("--gmail-password", type=str, help="Gmail password")
     parser.add_argument("--nine-router-password", type=str, help="9router dashboard password")
     parser.add_argument("--nine-router-url", type=str, help="9router API URL")
+    parser.add_argument("--cf-password", type=str, help="Shared Cloudflare password for all accounts (default: random per account)")
     args = parser.parse_args()
 
     # Load config
@@ -242,6 +281,11 @@ async def main():
     gmail_password = args.gmail_password or load_env_or_config("GMAIL_APP_PASSWORD", ["gmail.password"])
     nine_router_password = args.nine_router_password or load_env_or_config("NINE_ROUTER_PASSWORD", ["nine_router.password"])
     nine_router_url = load_env_or_config("NINE_ROUTER_URL", ["nine_router.api_url"])
+    cf_password = args.cf_password or load_env_or_config("CF_PASSWORD", ["cf.password"], "") or ""
+
+    if cf_password and len(cf_password) < 5:
+        console.print("[red]Error: CF_PASSWORD must be at least 5 characters (Cloudflare minimum)[/red]")
+        sys.exit(1)
 
     domains_file = args.domains or load_env_or_config("DOMAINS_FILE", ["domains_file"], "domains.txt")
 
@@ -337,6 +381,7 @@ async def main():
                             headless,
                             progress,
                             account_task,
+                            cf_password=cf_password,
                         )
 
                         if result["success"]:
@@ -381,12 +426,12 @@ async def main():
                         auth_token = client.login(nine_router_password)
 
                         for entry in entries:
-                            result = client.bulk_deploy(auth_token, [entry])
-                            # 9router returns {success: N, failed: N, created: [...], errors: [...]}
-                            if result.get("success", 0) > 0:
+                            result = client.deploy_provider(auth_token, entry)
+                            # Single-create endpoint: success unless flagged or request failed
+                            if result.get("success", True) is not False:
                                 console.print(f"[green]✓ Deployed {entry['accountId']}[/green]")
                             else:
-                                errors = result.get("errors", [])
+                                errors = result.get("errors") or result.get("message") or result
                                 console.print(f"[red]✗ Deploy failed {entry['accountId']}: {errors}[/red]")
 
                         console.print("[green]Batch deployment complete[/green]")

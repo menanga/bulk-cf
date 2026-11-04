@@ -192,11 +192,11 @@ graph TD
 
 ### 2. Token Creation (`src/token_creator.py`)
 
-- Creates Workers AI token with permissions:
-  - `Workers AI:Edit`
-  - `Workers AI:Read`
+- Creates a **full-access** API token (`cfut_*`) directly via API — no dashboard UI journey
+  - `GET /api/v4/user/tokens/permission_groups` → all selectable permission groups
+  - `POST /api/v4/user/tokens` → allow-policy over all accounts/zones/user-tag ([docs](https://developers.cloudflare.com/fundamentals/api/how-to/create-via-api/))
+- Uses the authenticated dashboard session (cookie) from the open browser tab
 - Validates token via `https://api.cloudflare.com/client/v4/user/tokens/verify`
-- **Fixed:** Properly navigates token creation UI (handles radio buttons, permission dropdowns)
 
 ### 3. Batch Processing (`main.py`)
 
@@ -221,7 +221,7 @@ bluk-cf/
 ├── main.py                  # Entry point (batch processor)
 ├── src/
 │   ├── signup_flow.py       # Cloudflare signup automation
-│   ├── token_creator.py     # Workers AI token creation
+│   ├── token_creator.py     # Full-access API token creation (API-only)
 │   ├── validator.py         # Token validation
 │   └── deployer.py          # 9router API batch deploy
 ├── domains.txt              # Email domains (one per line)
@@ -271,9 +271,9 @@ Check `output/` directory for CSV exports.
 
 **Solution:** Enable 2FA on Gmail, generate App Password ([guide](https://support.google.com/mail/answer/185833)), paste into `.env`.
 
-### 3. Token creation fails (no permissions)
+### 3. Token creation fails
 
-**Fix applied:** Script now correctly selects `Workers AI:Edit` and `Workers AI:Read` via Playwright selectors. Ensure you're logged in after email verification.
+**Fix applied:** Token is now created directly via `POST /api/v4/user/tokens` (no brittle UI). Ensure the account email is verified and the dashboard session is still logged in — an unverified email makes the API reject token creation.
 
 ### 4. Docker "Chrome not found"
 

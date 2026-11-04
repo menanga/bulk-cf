@@ -16,11 +16,13 @@ import nodriver as uc
 
 
 class EmailVerifyResult:
-    def __init__(self, success: bool, error: str = "", link: str = "", otp: str = ""):
+    def __init__(self, success: bool, error: str = "", link: str = "", otp: str = "", uid: str = ""):
         self.success = success
         self.error = error
         self.link = link
         self.otp = otp
+        # Gmail IMAP UID of the message the link came from (for cleanup).
+        self.uid = uid
 
 
 CF_VERIFY_PATTERNS = [
@@ -29,6 +31,27 @@ CF_VERIFY_PATTERNS = [
     r'https://www\.cloudflare\.com/[^\"><\s]+',
     r'https://cloudflare\.com/[^\"><\s]+',
 ]
+
+# Links that merely mention "email" but are NOT the verification endpoint
+# (footer/unsubscribe junk would otherwise win the keyword match).
+CF_LINK_EXCLUDES = (
+    "unsubscribe",
+    "email-preferences",
+    "email-protection",
+    "preferences",
+    "password-reset",
+)
+
+# Ranked by likelihood of being the true verification link.
+CF_VERIFY_KEYWORDS = ("verify", "confirm", "activation", "challenge", "token", "email")
+
+
+def _verify_rank(url: str) -> int:
+    low = url.lower()
+    for i, keyword in enumerate(CF_VERIFY_KEYWORDS):
+        if keyword in low:
+            return i
+    return len(CF_VERIFY_KEYWORDS)
 
 
 def extract_verification_link(body: str) -> str:
@@ -43,10 +66,14 @@ def extract_verification_link(body: str) -> str:
     cleaned = []
     for url in candidates:
         url = url.rstrip("').,;]>\"\\")
-        url = unquote(url)
         low = url.lower()
-        if any(k in low for k in ("verify", "confirm", "activation", "email", "token", "challenge")):
-            cleaned.append(url)
+        if any(x in low for x in CF_LINK_EXCLUDES):
+            continue
+        if any(k in low for k in CF_VERIFY_KEYWORDS):
+            cleaned.append(unquote(url))
+
+    # Prefer actual verify/confirm links over generic "email" mentions.
+    cleaned.sort(key=_verify_rank)
 
     if not cleaned:
         for url in candidates:
@@ -105,7 +132,7 @@ def _check_gmail_inbox(
         mail.login(gmail_user, gmail_password)
         mail.select("inbox")
 
-        _, search_data = mail.search(None, f'TO "{target_email}"')
+        _, search_data = mail.uid("SEARCH", None, f'TO "{target_email}"')
         mail_ids = search_data[0].split()
 
         if not mail_ids:
@@ -113,7 +140,7 @@ def _check_gmail_inbox(
 
         parser = BytesParser()
         for mail_id in reversed(mail_ids):
-            _, msg_data = mail.fetch(mail_id, "(RFC822)")
+            _, msg_data = mail.uid("FETCH", mail_id, "(RFC822)")
             raw_email = msg_data[0][1]
             msg = parser.parsebytes(raw_email)
 
@@ -126,7 +153,9 @@ def _check_gmail_inbox(
             otp = _extract_otp(body)
 
             if link:
-                return EmailVerifyResult(success=True, link=link, otp=otp)
+                return EmailVerifyResult(
+                    success=True, link=link, otp=otp, uid=mail_id.decode()
+                )
 
         return EmailVerifyResult(success=False)
 
@@ -158,4 +187,52 @@ def _extract_otp(body: str) -> str:
     return match.group(1) if match else ""
 
 
-__all__ = ["EmailVerifyResult", "verify_cloudflare_email", "extract_verification_link"]
+def delete_verification_email(
+    gmail_user: str,
+    gmail_password: str,
+    target_email: str,
+    uid: str = "",
+) -> bool:
+    """Expunge the Cloudflare verification email(s) for target_email from Gmail.
+
+    When uid is given (from EmailVerifyResult) only that message is deleted;
+    otherwise all messages addressed to target_email are deleted (each
+    generated address is single-use). Keeps the catch-all inbox clean and
+    stops stale/expired verification links from being picked up again.
+    """
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(gmail_user, gmail_password)
+        mail.select("inbox")
+
+        if uid:
+            uids = [uid.encode()]
+        else:
+            _, search_data = mail.uid("SEARCH", None, f'TO "{target_email}"')
+            uids = search_data[0].split()
+
+        if not uids:
+            return True  # nothing to delete counts as success
+
+        for message_uid in uids:
+            mail.uid("STORE", message_uid, "+FLAGS", "(\\Deleted)")
+        mail.expunge()
+        return True
+    except Exception:
+        return False
+    finally:
+        if mail:
+            try:
+                mail.close()
+                mail.logout()
+            except:
+                pass
+
+
+__all__ = [
+    "EmailVerifyResult",
+    "verify_cloudflare_email",
+    "extract_verification_link",
+    "delete_verification_email",
+]
