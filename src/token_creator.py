@@ -16,9 +16,12 @@ How full access is built (per docs):
    fails validation with HTTP 400 ("These rules must pass for ...").
    Each policy is also chunked to max 300 permission_groups (API limit).
 3. If the full-access payload is still rejected (400), fall back to a
-   Workers AI Read/Write + Account Analytics Read token so every account is
-   AI-capable and can read account analytics (analytics group resolved by
-   name from the live listing; skipped with a warning if not present).
+   Workers AI Read/Write + Workers Scripts: Edit + Account Analytics: Read
+   token so every account is AI-capable, can edit Workers scripts, and can
+   read account analytics. Both name-resolved groups are matched by exact
+   name in the live listing and are REQUIRED: if either is absent, the
+   fallback variant is dropped and the run fails hard rather than minting a
+   token that silently lacks a promised capability.
 4. The response contains result.value (cfut_...) — the secret is shown only once.
 
 Why API-only:
@@ -58,6 +61,14 @@ MAX_GROUPS_PER_POLICY = 300
 # guaranteed fallback scope so accounts always end up Workers AI-capable.
 WORKERS_AI_READ_ID = "a92d2450e05d4e7bb7d0a64968f83d11"
 WORKERS_AI_WRITE_ID = "bacc64e0f6c34fc0883a1223f938a104"
+
+# Fallback capabilities with no documented-stable id, so each is resolved from
+# the live permission-group listing by exact name. All of them are REQUIRED: a
+# missing match disables the fallback variant and fails the run (see
+# create_token_api) rather than silently downgrading the token.
+WORKERS_SCRIPTS_EDIT_NAME = "Workers Scripts: Edit"
+ACCOUNT_ANALYTICS_READ_NAME = "Account Analytics: Read"
+REQUIRED_FALLBACK_GROUPS = (WORKERS_SCRIPTS_EDIT_NAME, ACCOUNT_ANALYTICS_READ_NAME)
 
 # Cloudflare flips the "email verified" flag asynchronously after the link is
 # opened; tolerate that propagation when the API reports verify-your-email.
@@ -201,13 +212,48 @@ async def _get_all_permission_groups(page: uc.Tab) -> tuple[list[dict], dict]:
     return groups, {}
 
 
-def _find_group(groups: list[dict], keywords: tuple) -> dict:
-    """First group whose (lower-cased) name contains all keywords."""
+def _normalize_group_name(name: str) -> str:
+    """Canonical form of a human-readable permission-group label.
+
+    Casing, punctuation (the ": " in "Workers Scripts: Edit") and whitespace
+    drift across the listing, so they are normalised away before comparing.
+    """
+    spaced = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in name)
+    return " ".join(spaced.lower().split())
+
+
+def _find_group_exact(groups: list[dict], expected_name: str) -> dict:
+    """First group whose normalised name equals `expected_name` exactly.
+
+    A broader or similarly named group (for example a compound "... Read &
+    Edit" label) never stands in for the required one — exactness is what lets
+    a miss be treated as a hard failure instead of a silent downgrade.
+    """
+    target = _normalize_group_name(expected_name)
+    if not target:
+        return {}
     for group in groups:
-        name = (group.get("name") or "").lower()
-        if name and all(k in name for k in keywords):
+        if _normalize_group_name(group.get("name") or "") == target:
             return group
     return {}
+
+
+def _similar_group_names(groups: list[dict], expected_name: str, limit: int = 5) -> list[str]:
+    """Listing names sharing the leading words of `expected_name`.
+
+    Used only to make a required-group miss debuggable at a glance: the log
+    shows what Cloudflare actually calls the group in this account's listing.
+    """
+    words = _normalize_group_name(expected_name).split()
+    if not words:
+        return []
+    probe = " ".join(words[:2])
+    near = [
+        str(group.get("name") or "")
+        for group in groups
+        if probe in _normalize_group_name(group.get("name") or "")
+    ]
+    return near[:limit]
 
 
 def _scope_buckets(scopes: Any) -> set:
@@ -308,9 +354,15 @@ async def create_token_api(
     with HTTP 400 ("These rules must pass for ...").
 
     If the strict payload is rejected with 400, one fallback attempt is made
-    with Workers AI Read/Write + Account Analytics Read (guaranteed
-    capability, like the original API path). Retries on 429 with exponential
-    backoff.
+    with Workers AI Read/Write + Workers Scripts: Edit + Account Analytics:
+    Read (guaranteed capability, like the original API path). Retries on 429
+    with exponential backoff.
+
+    Every name in REQUIRED_FALLBACK_GROUPS must exist in the live
+    permission-group listing (matched by exact normalised name). If any is
+    missing, no fallback variant is offered and a 400 on the full-access
+    payload fails the run with "fallback_group_missing:<names>" instead of
+    creating a token that lacks a promised capability.
     """
     print("    Listing permission groups for full-access token...")
     groups, list_error = await _get_all_permission_groups(page)
@@ -331,23 +383,45 @@ async def create_token_api(
     if not policies:
         return TokenResult(False, token_name=token_name, error="permission_groups_no_scopes", method="api")
 
-    # Guaranteed fallback scope: Workers AI Read/Write (stable ids) plus
-    # "Account Analytics Read", resolved by name from the live listing since
-    # no reliable hardcoded id exists for it.
+    # Guaranteed fallback scope: Workers AI Read/Write (stable ids) plus every
+    # REQUIRED_FALLBACK_GROUPS name, matched exactly in the live listing.
     fallback_account_ids = [WORKERS_AI_READ_ID, WORKERS_AI_WRITE_ID]
     fallback_zone_ids: list[str] = []
-    analytics_group = _find_group(groups, ("account analytics", "read"))
-    if analytics_group:
-        buckets = _scope_buckets(analytics_group.get("scopes")) or {"account"}
-        if "zone" in buckets and "account" not in buckets:
-            fallback_zone_ids.append(analytics_group["id"])
-        else:
-            fallback_account_ids.append(analytics_group["id"])
-        print(f"    Fallback includes '{analytics_group.get('name')}' ({analytics_group['id']}).")
-    else:
-        print("    ⚠️ Account Analytics Read group not found in listing; fallback stays Workers AI only.")
+    missing_required: list[str] = []
 
-    workers_ai_policies = [
+    def _add_required_group(expected_name: str) -> None:
+        """Resolve a required fallback capability and bucket it by its own scope.
+
+        A permission group only applies to the resource bucket it is scoped
+        for; these are account-scoped, but a zone-only scope reported by the
+        listing is honoured. A miss is recorded rather than downgrading the
+        fallback token with a partial scope.
+        """
+        group = _find_group_exact(groups, expected_name)
+        if not group:
+            missing_required.append(expected_name)
+            near = _similar_group_names(groups, expected_name)
+            print(
+                f"    ❌ Required group '{expected_name}' not found in listing "
+                f"(similar entries: {near or 'none'})"
+            )
+            return
+        buckets = _scope_buckets(group.get("scopes")) or {"account"}
+        if "zone" in buckets and "account" not in buckets:
+            fallback_zone_ids.append(group["id"])
+        else:
+            fallback_account_ids.append(group["id"])
+        print(f"    Fallback includes '{group.get('name')}' ({group['id']}).")
+
+    for required_name in REQUIRED_FALLBACK_GROUPS:
+        _add_required_group(required_name)
+
+    fallback_error = ""
+    if missing_required:
+        fallback_error = "fallback_group_missing:" + ", ".join(missing_required)
+        print("    ❌ Fallback disabled: required permission group(s) unavailable.")
+
+    fallback_policies = [
         {
             "effect": "allow",
             "resources": dict(POLICY_RESOURCES["account"]),
@@ -355,7 +429,7 @@ async def create_token_api(
         }
     ]
     if fallback_zone_ids:
-        workers_ai_policies.append(
+        fallback_policies.append(
             {
                 "effect": "allow",
                 "resources": dict(POLICY_RESOURCES["zone"]),
@@ -364,14 +438,18 @@ async def create_token_api(
         )
 
     # Variant 1: full access (all groups, chunked under the 300-per-policy cap).
-    # Variant 2: Workers AI fallback so the account is always usable for AI.
-    variants = [("full", policies), ("workers_ai", workers_ai_policies)]
+    # Variant 2: the reduced fallback, only when every required group resolved.
+    variants = [("full", policies)]
+    if not fallback_error:
+        variants.append(("fallback", fallback_policies))
 
     # The verified flag can lag behind the banner check; keep trying while the
     # API still reports verify-your-email instead of failing the whole account.
     waited = 0.0
     while True:
-        result = await _post_token_variants(page, variants, token_name, max_retries)
+        result = await _post_token_variants(
+            page, variants, token_name, max_retries, fallback_error=fallback_error
+        )
         if result.error != "email_not_verified":
             return result
         if waited >= VERIFY_PROPAGATION_MAX_WAIT:
@@ -389,8 +467,15 @@ async def _post_token_variants(
     variants: list,
     token_name: str,
     max_retries: int,
+    fallback_error: str = "",
 ) -> TokenResult:
-    """POST each policy variant until a token is created (400 on 'full' -> next)."""
+    """POST each policy variant until a token is created (400 on 'full' -> next).
+
+    fallback_error carries the reason the fallback variant is unavailable (one
+    or more required permission groups were missing). When set, a 400 on the
+    full-access payload surfaces that reason instead of a generic validation
+    failure.
+    """
     for variant_name, variant_policies in variants:
         payload = json.dumps({"name": token_name, "condition": {}, "policies": variant_policies})
         print(f"    Creating token via POST /api/v4/user/tokens ({variant_name} policies)...")
@@ -441,7 +526,20 @@ async def _post_token_variants(
                 # Keep validation messages long enough to debug policy rejections.
                 snippet = body_text[:2000].replace("\n", " ")
                 if status == 400 and variant_name == "full":
-                    print("    ⚠️ Full-access payload rejected (400); falling back to Workers AI scope...")
+                    if fallback_error:
+                        # No fallback variant exists — report the missing
+                        # required group rather than minting a degraded token.
+                        return TokenResult(
+                            False,
+                            token_name=token_name,
+                            error=(
+                                f"{fallback_error} "
+                                f"(full-access payload also rejected: {snippet[:300]})"
+                            ),
+                            method="api",
+                            raw={"status": status, "body": snippet},
+                        )
+                    print("    ⚠️ Full-access payload rejected (400); falling back to the reduced scope...")
                     break
                 if status == 403 and "Attention Required" in body_text:
                     return TokenResult(
