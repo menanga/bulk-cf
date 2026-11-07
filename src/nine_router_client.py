@@ -1,6 +1,12 @@
+import os
 import socket
 import httpx
 from typing import Any
+
+
+def _env_bool(key: str, default: bool = True) -> bool:
+    """Parse a boolean env var (true/1/yes = on)."""
+    return os.getenv(key, str(default).lower()).strip().lower() in ("true", "1", "yes")
 
 
 class NineRouterClient:
@@ -8,6 +14,8 @@ class NineRouterClient:
         self.base_url = base_url.rstrip("/")
         self.client = httpx.Client(timeout=30.0)
         self.token: str | None = None
+        # Toggle tag_provider() on/off after a successful deploy (default: on).
+        self.tag_provider_enabled: bool = _env_bool("NINE_ROUTER_TAG_PROVIDER", True)
 
         # Pre-flight DNS check
         netloc = self.base_url.split("//")[-1].split("/")[0]
@@ -72,6 +80,8 @@ class NineRouterClient:
 
     def tag_provider(self, token: str, provider_id: str, tag: str) -> dict[str, Any]:
         """Tag an existing provider connection with the email domain."""
+        if not self.tag_provider_enabled:
+            return {}
         response = self.client.put(
             f"{self.base_url}/providers/{provider_id}",
             headers=self._headers(token),

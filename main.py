@@ -432,19 +432,25 @@ async def main():
                                 console.print(f"[green]✓ Deployed {entry['accountId']}[/green]")
 
                                 # Tag the created connection with the email domain
-                                provider_id = client.extract_provider_id(result)
-                                tag = client.domain_from_email(entry.get("email"))
-                                if not provider_id:
-                                    console.print(f"[yellow]⚠ No provider id in response, skip tag for {entry['accountId']}[/yellow]")
-                                elif not tag:
-                                    console.print(f"[yellow]⚠ No email domain for {entry.get('email')}, skip tag[/yellow]")
+                                if not client.tag_provider_enabled:
+                                    console.print(
+                                        f"[dim]⊖ Tagging disabled (NINE_ROUTER_TAG_PROVIDER=false), "
+                                        f"skip tag for {entry['accountId']}[/dim]"
+                                    )
                                 else:
-                                    try:
-                                        client.tag_provider(auth_token, provider_id, tag)
-                                        console.print(f"[green]✓ Tagged {provider_id} with '{tag}'[/green]")
-                                    except Exception as tag_error:
-                                        logger.exception(f"9router tag error for {provider_id}: {tag_error}")
-                                        console.print(f"[red]✗ Tag failed {provider_id}: {tag_error}[/red]")
+                                    provider_id = client.extract_provider_id(result)
+                                    tag = client.domain_from_email(entry.get("email"))
+                                    if not provider_id:
+                                        console.print(f"[yellow]⚠ No provider id in response, skip tag for {entry['accountId']}[/yellow]")
+                                    elif not tag:
+                                        console.print(f"[yellow]⚠ No email domain for {entry.get('email')}, skip tag[/yellow]")
+                                    else:
+                                        try:
+                                            client.tag_provider(auth_token, provider_id, tag)
+                                            console.print(f"[green]✓ Tagged {provider_id} with '{tag}'[/green]")
+                                        except Exception as tag_error:
+                                            logger.exception(f"9router tag error for {provider_id}: {tag_error}")
+                                            console.print(f"[red]✗ Tag failed {provider_id}: {tag_error}[/red]")
                             else:
                                 errors = result.get("errors") or result.get("message") or result
                                 console.print(f"[red]✗ Deploy failed {entry['accountId']}: {errors}[/red]")
