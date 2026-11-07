@@ -63,12 +63,15 @@ WORKERS_AI_READ_ID = "a92d2450e05d4e7bb7d0a64968f83d11"
 WORKERS_AI_WRITE_ID = "bacc64e0f6c34fc0883a1223f938a104"
 
 # Fallback capabilities with no documented-stable id, so each is resolved from
-# the live permission-group listing by exact name. All of them are REQUIRED: a
-# missing match disables the fallback variant and fails the run (see
-# create_token_api) rather than silently downgrading the token.
-WORKERS_SCRIPTS_EDIT_NAME = "Workers Scripts: Edit"
+# the live permission-group listing by exact name. Cloudflare renames groups over
+# time (e.g. "Workers Scripts: Edit" is now "Workers Scripts Write"/"Read"), so
+# each entry may be a tuple of candidate spellings — the first match wins. All of
+# them are REQUIRED: a missing match disables the fallback variant and fails the
+# run rather than silently downgrading the token.
+WORKERS_SCRIPTS_EDIT_NAMES = ("Workers Scripts: Edit", "Workers Scripts Write", "Workers Scripts Read")
 ACCOUNT_ANALYTICS_READ_NAME = "Account Analytics: Read"
-REQUIRED_FALLBACK_GROUPS = (WORKERS_SCRIPTS_EDIT_NAME, ACCOUNT_ANALYTICS_READ_NAME)
+# Each entry is a name or a tuple of candidate names (first match wins).
+REQUIRED_FALLBACK_GROUPS = (WORKERS_SCRIPTS_EDIT_NAMES, ACCOUNT_ANALYTICS_READ_NAME)
 
 # Cloudflare flips the "email verified" flag asynchronously after the link is
 # opened; tolerate that propagation when the API reports verify-your-email.
@@ -389,20 +392,26 @@ async def create_token_api(
     fallback_zone_ids: list[str] = []
     missing_required: list[str] = []
 
-    def _add_required_group(expected_name: str) -> None:
+    def _add_required_group(candidate_names: tuple[str, ...] | str) -> None:
         """Resolve a required fallback capability and bucket it by its own scope.
 
-        A permission group only applies to the resource bucket it is scoped
-        for; these are account-scoped, but a zone-only scope reported by the
-        listing is honoured. A miss is recorded rather than downgrading the
-        fallback token with a partial scope.
+        `candidate_names` may be a single name or a tuple of candidate spellings
+        (Cloudflare renames groups over time). The first match wins. A miss is
+        recorded rather than downgrading the fallback token with a partial scope.
         """
-        group = _find_group_exact(groups, expected_name)
+        names = (candidate_names,) if isinstance(candidate_names, str) else candidate_names
+        group = {}
+        matched_name = ""
+        for name in names:
+            group = _find_group_exact(groups, name)
+            if group:
+                matched_name = name
+                break
         if not group:
-            missing_required.append(expected_name)
-            near = _similar_group_names(groups, expected_name)
+            missing_required.append(str(names[0]))
+            near = _similar_group_names(groups, names[0])
             print(
-                f"    ❌ Required group '{expected_name}' not found in listing "
+                f"    ❌ Required group '{names[0]}' not found in listing "
                 f"(similar entries: {near or 'none'})"
             )
             return
