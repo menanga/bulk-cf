@@ -59,6 +59,7 @@ class NineRouterClient:
             "provider": "cloudflare-ai",
             "apiKey": entry["apiKey"],
             "name": entry.get("email") or entry.get("name"),
+            "priority": 9999,
             "testStatus": "active",
             "providerSpecificData": {
                 "accountId": entry["accountId"]
